@@ -1,141 +1,46 @@
 <#
 .SYNOPSIS
-    Instalação/Atualização do OCS Inventory Agent + Configuração de Certificado.
+    Instalacao do OCS Inventory Agent com certificado SSL da CA interna.
 .DESCRIPTION
-    1. Verifica versão instalada vs versão GitHub.
-    2. Baixa e instala apenas se necessário (Upgrade ou Nova Instalação).
-    3. Cria/Atualiza o arquivo cacert.pem no diretório do agente.
+    Script auto-contido para deploy via ScreenConnect (ConnectWise).
+    1. Deploya o cacert.pem (Root CA + Sub CA) no path do agent.
+    2. Verifica versao instalada vs versao GitHub.
+    3. Baixa e instala o OCS Agent se necessario.
+
+    O certificado esta embutido no script para distribuicao simplificada.
+.PARAMETER ForceInstall
+    Forca reinstalacao mesmo se a versao ja estiver atualizada.
+.PARAMETER CertOnly
+    Apenas deploya o certificado, sem instalar/atualizar o agent.
 .NOTES
     Execute como Administrador.
+    Distribuir via ScreenConnect backstage.
 #>
 
+param(
+    [switch]$ForceInstall,
+    [switch]$CertOnly
+)
+
 $ErrorActionPreference = "Stop"
-$downloadDir = "$env:TEMP\AutoInstall"
-$ocsExtractDir = "$downloadDir\OCS_Extracted"
-$ocsServerUrl = "http://assets.madeiramadeira.com.br/ocsinventory"
-# Caminho padrão de instalação do OCS (x64)
-$ocsExePath = "$env:ProgramFiles\OCS Inventory Agent\OCSInventory.exe"
-# Caminho de dados do Agente (onde fica o cacert.pem)
-$ocsDataDir = "C:\ProgramData\OCS Inventory NG\Agent"
 
-# --- Funções Auxiliares ---
-function Write-Log {
-    param([string]$Message, [string]$Color="White")
-    Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] $Message" -ForegroundColor $Color
-}
+# ============================================================
+# CONFIGURACAO — altere aqui se necessario
+# ============================================================
+$ocsServerUrl   = "http://assets.madeiramadeira.com.br/ocsinventory"
+$ocsExePath     = "$env:ProgramFiles\OCS Inventory Agent\OCSInventory.exe"
+$cacertDir      = "$env:ProgramData\OCS Inventory NG\Agent"
+$cacertPath     = "$cacertDir\cacert.pem"
+$downloadDir    = "$env:TEMP\OCS_AutoInstall"
+$ocsExtractDir  = "$downloadDir\OCS_Extracted"
+$githubApi      = "https://api.github.com/repos/OCSInventory-NG/WindowsAgent/releases/latest"
 
-function Get-OnlineVersion {
-    param([string]$Url)
-    Write-Log "Consultando GitHub..." "Yellow"
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    return Invoke-RestMethod -Uri $Url
-}
-
-# --- Início ---
-
-# 1. Verifica Admin
-if (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
-    Write-Log "ERRO: Execute como Administrador." "Red"; Break
-}
-
-try {
-    Write-Log "--- Verificação de Versão OCS ---" "Cyan"
-
-    # 2. Obtém informações do GitHub
-    $releaseInfo = Get-OnlineVersion "https://api.github.com/repos/OCSInventory-NG/WindowsAgent/releases/latest"
-    
-    # Limpa o "v" da tag (ex: v2.10.0.0 -> 2.10.0.0) para comparação
-    $onlineVersionStr = $releaseInfo.tag_name -replace "^v",""
-    
-    try {
-        $onlineVersion = [System.Version]$onlineVersionStr
-    } catch {
-        # Fallback se a tag vier em formato estranho, assume que precisa instalar
-        $onlineVersion = [System.Version]"99.99.99.99"
-    }
-
-    $needInstall = $true
-
-    # 3. Verifica Instalação Local
-    if (Test-Path $ocsExePath) {
-        $localFile = Get-Item $ocsExePath
-        $localVersionStr = $localFile.VersionInfo.ProductVersion
-        
-        # Correção: As vezes o OCS retorna versão com vírgulas ou espaços
-        $localVersionClean = $localVersionStr -replace ",","." -replace " ",""
-        
-        try {
-            $localVersion = [System.Version]$localVersionClean
-            
-            Write-Log "Versão Local:  $localVersion" "Gray"
-            Write-Log "Versão GitHub: $onlineVersion" "Gray"
-
-            if ($localVersion -ge $onlineVersion) {
-                Write-Log "O sistema já possui a versão mais recente." "Green"
-                $needInstall = $false
-            } else {
-                Write-Log "Atualização encontrada! Iniciando processo..." "Magenta"
-            }
-        } catch {
-            Write-Log "Não foi possível ler a versão local corretamente. Forçando reinstalação." "Red"
-        }
-    } else {
-        Write-Log "OCS Agent não encontrado. Iniciando instalação limpa." "Magenta"
-    }
-
-    # 4. Processo de Instalação (Só roda se $needInstall for true)
-    if ($needInstall) {
-        
-        # Prepara diretórios
-        if (Test-Path -Path $downloadDir) { Remove-Item -Path $downloadDir -Recurse -Force -ErrorAction SilentlyContinue }
-        New-Item -ItemType Directory -Path $downloadDir | Out-Null
-        New-Item -ItemType Directory -Path $ocsExtractDir | Out-Null
-
-        # Busca Asset (ZIP ou EXE)
-        $asset = $releaseInfo.assets | Where-Object { $_.name -like "*x64.zip" } | Select-Object -First 1
-        if (-not $asset) {
-            $asset = $releaseInfo.assets | Where-Object { $_.name -like "*x64.exe" } | Select-Object -First 1
-        }
-        if (-not $asset) { throw "Instalador não encontrado no GitHub." }
-
-        $ocsUrl = $asset.browser_download_url
-        $ocsFile = "$downloadDir\$($asset.name)"
-
-        Write-Log "Baixando: $($asset.name)..." "Yellow"
-        Invoke-WebRequest -Uri $ocsUrl -OutFile $ocsFile
-
-        # Extração (Se ZIP)
-        if ($ocsFile -like "*.zip") {
-            Write-Log "Extraindo..." "Yellow"
-            Expand-Archive -Path $ocsFile -DestinationPath $ocsExtractDir -Force
-            $ocsInstaller = Get-ChildItem -Path $ocsExtractDir -Filter "*.exe" -Recurse | Select-Object -First 1 | Select-Object -ExpandProperty FullName
-        } else {
-            $ocsInstaller = $ocsFile
-        }
-
-        if (-not $ocsInstaller) { throw "Instalador não encontrado após download." }
-
-        Write-Log "Instalando..." "Yellow"
-        # /Upgrade garante atualização suave se já existir
-        $ocsArgs = "/S /NOSPLASH /NO_START_MENU /NOW /SERVER=$ocsServerUrl /UPGRADE"
-        
-        $process = Start-Process -FilePath $ocsInstaller -ArgumentList $ocsArgs -Wait -PassThru
-        
-        if ($process.ExitCode -eq 0) {
-            Write-Log "Instalação/Atualização concluída com sucesso!" "Green"
-        } else {
-            Write-Log "A instalação terminou com código: $($process.ExitCode)" "Red"
-        }
-
-        # Limpeza
-        Remove-Item -Path $downloadDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-
-    # 5. Configuração do Arquivo cacert.pem (Executa sempre para garantir que o arquivo exista)
-    Write-Log "--- Verificando Certificado (cacert.pem) ---" "Cyan"
-
-    # Conteúdo do certificado (Embutido para não depender de link externo)
-    $certContent = @"
+# ============================================================
+# CERTIFICADO CA INTERNA (Root CA + Sub CA)
+# MadeiraMadeira Root CA (valido ate 2040)
+# MadeiraMadeira Sub CA  (valido ate 2030)
+# ============================================================
+$cacertContent = @"
 -----BEGIN CERTIFICATE-----
 MIIDHTCCAgWgAwIBAgIQL0E0j0fqhpNLO2fgP6k8UDANBgkqhkiG9w0BAQsFADAh
 MR8wHQYDVQQDExZNYWRlaXJhTWFkZWlyYSBSb290IENBMB4XDTIwMDQyODE4NDg0
@@ -173,7 +78,7 @@ cDovL3BraS5tYWRlaXJhbWFkZWlyYS5sb2NhbC9jcHMudHh0MBkGCSsGAQQBgjcU
 AgQMHgoAUwB1AGIAQwBBMAsGA1UdDwQEAwIBhjAPBgNVHRMBAf8EBTADAQH/MB8G
 A1UdIwQYMBaAFJFVpYoS8x240ydiVfdU9+d/j+9VMIIBMwYDVR0fBIIBKjCCASYw
 ggEioIIBHqCCARqGgcxsZGFwOi8vL0NOPU1hZGVpcmFNYWRlaXJhJTIwUm9vdCUy
-MENBLENOPU1NLVJvb3RDQSxDTj1DRFAsQ049UHVibGljJTIwS2V5JTIwU2Vydmlj
+MENBLENOPU1TLVJvb3RDQSxDTj1DRFAsQ049UHVibGljJTIwS2V5JTIwU2Vydmlj
 ZXMsQ049U2VydmljZXMsQ049Q29uZmlndXJhdGlvbixEQz1tYWRlaXJhbWFkZWly
 YSxEQz1sb2NhbD9jZXJ0aWZpY2F0ZVJldm9jYXRpb25MaXN0P2Jhc2U/b2JqZWN0
 Q2xhc3M9Y1JMRGlzdHJpYnV0aW9uUG9pbnSGSWh0dHA6Ly9wa2kubWFkZWlyYW1h
@@ -194,19 +99,216 @@ NX+EosBnPJAaLuDtbm0bYAusIVFe
 -----END CERTIFICATE-----
 "@
 
-    if (Test-Path $ocsDataDir) {
-        $certPath = "$ocsDataDir\cacert.pem"
+# ============================================================
+# FUNCOES AUXILIARES
+# ============================================================
+
+function Write-Log {
+    # Exibe mensagem com timestamp e cor no console
+    param([string]$Message, [string]$Color = "White")
+    Write-Host "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] $Message" -ForegroundColor $Color
+}
+
+function Get-OnlineVersion {
+    # Consulta a API do GitHub para obter a ultima release do OCS Agent
+    param([string]$Url)
+    Write-Log "Consultando versao no GitHub..." "Yellow"
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    return Invoke-RestMethod -Uri $Url
+}
+
+# ============================================================
+# INICIO
+# ============================================================
+
+# Verifica se esta rodando como Administrador
+if (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole] "Administrator")) {
+    Write-Log "ERRO: Execute como Administrador." "Red"
+    exit 1
+}
+
+Write-Log "=== OCS Inventory Agent - Install + Certificado ===" "Cyan"
+
+# ------------------------------------------------------------
+# ETAPA 1: Deploy do certificado cacert.pem
+# ------------------------------------------------------------
+Write-Log "--- Etapa 1: Deploy do certificado ---" "Cyan"
+
+try {
+    # Cria o diretorio do agent se nao existir (ex: instalacao nova)
+    if (-not (Test-Path $cacertDir)) {
+        Write-Log "Criando diretorio: $cacertDir" "Yellow"
+        New-Item -ItemType Directory -Path $cacertDir -Force | Out-Null
+    }
+
+    # Faz backup do certificado anterior se existir
+    if (Test-Path $cacertPath) {
+        $timestamp = (Get-Date).ToString('yyyyMMdd_HHmmss')
+        $backupPath = "$cacertPath.bak_$timestamp"
+        Copy-Item -Path $cacertPath -Destination $backupPath -Force
+        Write-Log "Backup do certificado anterior: $backupPath" "Gray"
+    }
+
+    # Escreve o novo certificado
+    $cacertContent | Set-Content -Path $cacertPath -Encoding ASCII -Force
+    Write-Log "Certificado deployado em: $cacertPath" "Green"
+
+} catch {
+    Write-Log "ERRO ao deployar certificado: $_" "Red"
+    exit 1
+}
+
+# Se -CertOnly foi passado, para aqui
+if ($CertOnly) {
+    Write-Log "Modo CertOnly: certificado deployado. Encerrando." "Green"
+    exit 0
+}
+
+# ------------------------------------------------------------
+# ETAPA 2: Verificacao de versao do OCS Agent
+# ------------------------------------------------------------
+Write-Log "--- Etapa 2: Verificacao de versao ---" "Cyan"
+
+try {
+    $releaseInfo = Get-OnlineVersion $githubApi
+
+    # Limpa o "v" da tag (ex: v2.10.0.0 -> 2.10.0.0)
+    $onlineVersionStr = $releaseInfo.tag_name -replace "^v", ""
+
+    try {
+        $onlineVersion = [System.Version]$onlineVersionStr
+    } catch {
+        # Fallback se a tag vier em formato estranho
+        $onlineVersion = [System.Version]"99.99.99.99"
+    }
+
+    $needInstall = $true
+
+    # Verifica se o agent ja esta instalado
+    if (Test-Path $ocsExePath) {
+        $localFile = Get-Item $ocsExePath
+        $localVersionStr = $localFile.VersionInfo.ProductVersion
+
+        # Corrige formatos inconsistentes (virgulas, espacos)
+        $localVersionClean = $localVersionStr -replace "," , "." -replace " ", ""
+
         try {
-            Set-Content -Path $certPath -Value $certContent -Encoding Ascii -Force
-            Write-Log "Arquivo salvo em: $certPath" "Green"
+            $localVersion = [System.Version]$localVersionClean
+
+            Write-Log "Versao local:  $localVersion" "Gray"
+            Write-Log "Versao GitHub: $onlineVersion" "Gray"
+
+            if ($localVersion -ge $onlineVersion -and -not $ForceInstall) {
+                Write-Log "Agent ja esta na versao mais recente." "Green"
+                $needInstall = $false
+            } else {
+                if ($ForceInstall) {
+                    Write-Log "ForceInstall ativado. Reinstalando..." "Magenta"
+                } else {
+                    Write-Log "Atualizacao encontrada! Iniciando processo..." "Magenta"
+                }
+            }
         } catch {
-            Write-Log "Erro ao salvar cacert.pem: $_" "Red"
+            Write-Log "Nao foi possivel ler a versao local. Forcando reinstalacao." "Red"
         }
     } else {
-        Write-Log "AVISO: Diretório '$ocsDataDir' não encontrado." "Yellow"
-        Write-Log "O Agente pode não ter sido instalado corretamente." "Yellow"
+        Write-Log "OCS Agent nao encontrado. Iniciando instalacao limpa." "Magenta"
+    }
+
+    # ------------------------------------------------------------
+    # ETAPA 3: Download e instalacao
+    # ------------------------------------------------------------
+    if ($needInstall) {
+        Write-Log "--- Etapa 3: Download e instalacao ---" "Cyan"
+
+        # Prepara diretorios temporarios
+        if (Test-Path -Path $downloadDir) {
+            Remove-Item -Path $downloadDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        New-Item -ItemType Directory -Path $downloadDir | Out-Null
+        New-Item -ItemType Directory -Path $ocsExtractDir | Out-Null
+
+        # Busca o asset de download (ZIP x64 ou EXE x64)
+        $asset = $releaseInfo.assets | Where-Object { $_.name -like "*x64.zip" } | Select-Object -First 1
+        if (-not $asset) {
+            $asset = $releaseInfo.assets | Where-Object { $_.name -like "*x64.exe" } | Select-Object -First 1
+        }
+        if (-not $asset) { throw "Instalador x64 nao encontrado no GitHub." }
+
+        $ocsUrl = $asset.browser_download_url
+        $ocsFile = "$downloadDir\$($asset.name)"
+
+        Write-Log "Baixando: $($asset.name)..." "Yellow"
+        Invoke-WebRequest -Uri $ocsUrl -OutFile $ocsFile -UseBasicParsing
+
+        # Extrai se for ZIP
+        if ($ocsFile -like "*.zip") {
+            Write-Log "Extraindo arquivo ZIP..." "Yellow"
+            Expand-Archive -Path $ocsFile -DestinationPath $ocsExtractDir -Force
+            $ocsInstaller = Get-ChildItem -Path $ocsExtractDir -Filter "*.exe" -Recurse |
+                            Select-Object -First 1 |
+                            Select-Object -ExpandProperty FullName
+        } else {
+            $ocsInstaller = $ocsFile
+        }
+
+        if (-not $ocsInstaller) { throw "Instalador nao encontrado apos download." }
+
+        Write-Log "Instalando OCS Agent..." "Yellow"
+        # /UPGRADE garante atualizacao suave se ja existir
+        $ocsArgs = "/S /NOSPLASH /NO_START_MENU /NOW /SERVER=$ocsServerUrl /UPGRADE"
+
+        $process = Start-Process -FilePath $ocsInstaller -ArgumentList $ocsArgs -Wait -PassThru
+
+        if ($process.ExitCode -eq 0) {
+            Write-Log "Instalacao concluida com sucesso!" "Green"
+        } else {
+            Write-Log "Instalacao terminou com codigo: $($process.ExitCode)" "Red"
+        }
+
+        # Limpeza dos arquivos temporarios
+        Remove-Item -Path $downloadDir -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Log "Arquivos temporarios removidos." "Gray"
     }
 
 } catch {
-    Write-Log "Erro Crítico: $_" "Red"
+    Write-Log "ERRO na instalacao: $_" "Red"
+    # Limpa temporarios mesmo em caso de erro
+    if (Test-Path -Path $downloadDir) {
+        Remove-Item -Path $downloadDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    exit 1
+}
+
+# ------------------------------------------------------------
+# ETAPA 4: Validacao final
+# ------------------------------------------------------------
+Write-Log "--- Etapa 4: Validacao ---" "Cyan"
+
+$allOk = $true
+
+# Verifica certificado
+if (Test-Path $cacertPath) {
+    $certSize = (Get-Item $cacertPath).Length
+    Write-Log "[OK] cacert.pem presente ($certSize bytes)" "Green"
+} else {
+    Write-Log "[FALHA] cacert.pem NAO encontrado em $cacertPath" "Red"
+    $allOk = $false
+}
+
+# Verifica agent instalado
+if (Test-Path $ocsExePath) {
+    $ver = (Get-Item $ocsExePath).VersionInfo.ProductVersion
+    Write-Log "[OK] OCS Agent instalado (versao: $ver)" "Green"
+} else {
+    Write-Log "[AVISO] OCS Agent nao encontrado em $ocsExePath" "Yellow"
+    if (-not $CertOnly) { $allOk = $false }
+}
+
+# Resultado final
+if ($allOk) {
+    Write-Log "=== Deploy concluido com sucesso! ===" "Green"
+} else {
+    Write-Log "=== Deploy concluido com avisos. Verifique os itens acima. ===" "Yellow"
 }
