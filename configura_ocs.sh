@@ -22,9 +22,9 @@ echo "=========================================="
 echo "[1/3] Criando a pasta $DIR_CERTS..."
 mkdir -p "$DIR_CERTS"
 
-# 3. Baixa o certificado para a pasta
+# 3. Baixa o certificado para a pasta usando wget
 echo "[2/3] Baixando o certificado cacert.crt..."
-curl -sL "$URL_CERT" -o "$ARQUIVO_CERT"
+wget -q -O "$ARQUIVO_CERT" "$URL_CERT"
 
 if [ $? -eq 0 ]; then
     echo "      -> Certificado baixado com sucesso!"
@@ -33,9 +33,9 @@ else
     exit 1
 fi
 
-# 4. Baixa e atualiza o arquivo de configuração do agente
+# 4. Baixa e atualiza o arquivo de configuração do agente usando wget
 echo "[3/3] Atualizando o arquivo de configuração ocsinventory-agent.cfg..."
-curl -sL "$URL_CFG" -o "$ARQUIVO_CFG"
+wget -q -O "$ARQUIVO_CFG" "$URL_CFG"
 
 if [ $? -eq 0 ]; then
     echo "      -> Configuração atualizada com sucesso!"
