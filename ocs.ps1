@@ -34,7 +34,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 # ============================================================
-# CONFIGURACAO — altere aqui se necessario
+# CONFIGURACAO - altere aqui se necessario
 # ============================================================
 # Servidor de comunicacao (HTTPS + validacao de certificado via CA interna)
 $ocsProtocol    = "https"
@@ -283,7 +283,7 @@ function Test-OcsInventoryLog {
     param([string[]]$NewLines)
 
     if (-not $NewLines -or $NewLines.Count -eq 0) {
-        Write-Log "[FALHA] Nenhuma linha nova gerada em OCSInventory.log — inventario nao rodou." "Red"
+        Write-Log "[FALHA] Nenhuma linha nova gerada em OCSInventory.log - inventario nao rodou." "Red"
         return $false
     }
 
@@ -546,7 +546,7 @@ if ($ini.Exists) {
     }
 } elseif (Test-Path $ocsExePath) {
     # Agent instalado mas sem .ini: cria um coerente com o alvo
-    Write-Log "ocsinventory.ini ausente — criando com a config desejada." "Magenta"
+    Write-Log "ocsinventory.ini ausente - criando com a config desejada." "Magenta"
     try {
         Set-OcsIniConfig -IniPath $ocsIniPath
         $configChanged = $true
@@ -627,7 +627,7 @@ if ($NoInventory) {
         if ($allLines.Count -gt $preLines) {
             $newLines = $allLines[$preLines..($allLines.Count - 1)]
         } else {
-            # Log foi rotacionado/truncado — analisa o conteudo inteiro
+            # Log foi rotacionado/truncado - analisa o conteudo inteiro
             $newLines = $allLines
         }
     } else {
@@ -666,7 +666,7 @@ if ($null -ne $inventoryOk) {
     if ($inventoryOk) {
         Write-Log "[OK] Inventario enviado e confirmado pelo servidor." "Green"
     } else {
-        Write-Log "[FALHA] Inventario nao confirmado — verifique conectividade/HTTPS/cert." "Red"
+        Write-Log "[FALHA] Inventario nao confirmado - verifique conectividade/HTTPS/cert." "Red"
     }
 }
 
