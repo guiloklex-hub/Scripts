@@ -3,11 +3,12 @@
     Instalacao + hardening do OCS Inventory Agent com certificado SSL da CA interna.
 .DESCRIPTION
     Script auto-contido para deploy via ScreenConnect (ConnectWise).
-    1. Deploya o cacert.pem (Root CA + Sub CA) no path do agent.
+    1. Deploya o cacert.pem (Root CA + Sub CA) no path do agent - usado apenas
+       pela infra interna (.local), nao pela comunicacao do agent.
     2. Verifica versao instalada vs versao GitHub e instala/atualiza se necessario
-       (com SSL habilitado, apontando para o servidor HTTPS interno).
-    3. Valida a configuracao ATUAL do agent no registro (Server/SSL) contra o
-       alvo desejado e corrige divergencias (ex.: maquinas antigas em HTTP).
+       (comunicacao com o servidor OCS em HTTP).
+    3. Valida a configuracao ATUAL do agent (ocsinventory.ini / registro) contra
+       o alvo desejado e corrige divergencias.
     4. Forca a execucao imediata do inventario, obrigando a comunicacao com o
        servidor, e valida o log (OCSInventory.log) para confirmar o envio.
 
@@ -36,11 +37,13 @@ $ErrorActionPreference = "Stop"
 # ============================================================
 # CONFIGURACAO - altere aqui se necessario
 # ============================================================
-# Servidor de comunicacao (HTTPS + validacao de certificado via CA interna)
-$ocsProtocol    = "https"
+# Comunicacao do agent com o servidor OCS em HTTP. O cacert.pem (CA interna
+# .local) e usado APENAS no deploy interno, nao na comunicacao do agent.
+# Para migrar a comunicacao para HTTPS no futuro: ocsProtocol="https" e ocsUseSsl=1.
+$ocsProtocol    = "http"
 $ocsServerHost  = "assets.madeiramadeira.com.br/ocsinventory"
 $ocsServerUrl   = "$ocsProtocol`://$ocsServerHost"
-$ocsUseSsl      = 1   # 1 = valida certificado do servidor (exige cacert.pem)
+$ocsUseSsl      = 0   # 0 = sem validacao de cert na comunicacao (HTTP). 1 = valida (exige cacert.pem no servidor)
 
 $ocsExePath     = "$env:ProgramFiles\OCS Inventory Agent\OCSInventory.exe"
 $ocsDataDir     = "$env:ProgramData\OCS Inventory NG\Agent"
@@ -51,7 +54,6 @@ $ocsLogPath     = "$ocsDataDir\OCSInventory.log"
 $downloadDir    = "$env:TEMP\OCS_AutoInstall"
 $ocsExtractDir  = "$downloadDir\OCS_Extracted"
 $githubApi      = "https://api.github.com/repos/OCSInventory-NG/WindowsAgent/releases/latest"
-$ocsServiceName = "OCS Inventory Service"
 
 # Chaves de registro onde o agent Windows guarda a config de comunicacao
 # (64-bit usa WOW6432Node; 32-bit usa o caminho nativo)
