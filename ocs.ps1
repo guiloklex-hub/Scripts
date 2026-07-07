@@ -39,11 +39,13 @@ $ErrorActionPreference = "Stop"
 # ============================================================
 # Comunicacao do agent com o servidor OCS em HTTP. O cacert.pem (CA interna
 # .local) e usado APENAS no deploy interno, nao na comunicacao do agent.
-# Para migrar a comunicacao para HTTPS no futuro: ocsProtocol="https" e ocsUseSsl=1.
+# SSL=1 fica gravado por padrao da MadeiraMadeira; como o Server e http://, o
+# cURL nao faz handshake TLS, entao esse flag nao afeta a comunicacao HTTP.
+# Para migrar a comunicacao para HTTPS no futuro: basta ocsProtocol="https".
 $ocsProtocol    = "http"
 $ocsServerHost  = "assets.madeiramadeira.com.br/ocsinventory"
 $ocsServerUrl   = "$ocsProtocol`://$ocsServerHost"
-$ocsUseSsl      = 0   # 0 = sem validacao de cert na comunicacao (HTTP). 1 = valida (exige cacert.pem no servidor)
+$ocsUseSsl      = 1   # padrao MadeiraMadeira. So tem efeito real quando ocsProtocol="https"
 
 $ocsExePath     = "$env:ProgramFiles\OCS Inventory Agent\OCSInventory.exe"
 $ocsDataDir     = "$env:ProgramData\OCS Inventory NG\Agent"
@@ -411,12 +413,15 @@ function Test-OcsInventoryLog {
 
     $text = ($NewLines -join "`n")
 
-    # Marcadores de sucesso do agent Windows do OCS
-    $okProlog    = $text -match 'Send Prolog Response'
-    $okInvSent   = $text -match 'Send Inventory Response'
-    $okInvGen    = $text -match 'Inventory successfully generated'
+    # Marcadores de sucesso. Cobrem o provider cURL do agent 2.x
+    # ("Inventory successfully sent" + "HTTP Status Code #2xx") e tambem os
+    # marcadores de versoes mais antigas (Prolog/Send Inventory Response).
+    $okHttp2xx = $text -match 'HTTP Status Code #2\d\d'
+    $okInvSent = ($text -match 'Inventory successfully sent') -or ($text -match 'Send Inventory Response')
+    $okInvGen  = ($text -match 'Inventory successfully generated') -or ($text -match 'Inventory successfully sent') -or ($text -match 'Sending .*Inventory')
 
-    # Marcadores de falha
+    # Marcadores de falha (criticos). Observacao: "Failed to write new inventory
+    # state" e um aviso benigno (nao afeta o envio) e NAO entra aqui.
     $failPatterns = @(
         'Cannot establish communication',
         'Failed to send',
@@ -425,7 +430,7 @@ function Test-OcsInventoryLog {
         'ERROR:',
         'SSL.*(fail|error|cannot)',
         'certificate.*(fail|cannot|verify)',
-        'HTTP.*(4\d\d|5\d\d)',
+        'HTTP Status Code #(4|5)\d\d',
         'timed out'
     )
     $failHits = @()
@@ -436,13 +441,18 @@ function Test-OcsInventoryLog {
     }
     $failHits = $failHits | Select-Object -Unique
 
-    # Sucesso = inventario enviado e aceito pelo servidor, sem erro critico
-    $success = ($okInvSent -or ($okInvGen -and $okProlog)) -and ($failHits.Count -eq 0)
+    # Sucesso = servidor respondeu 2xx e/ou o agent confirmou o envio, sem erro critico
+    $success = ($okInvSent -or $okHttp2xx) -and ($failHits.Count -eq 0)
 
     Write-Log "Analise do log de comunicacao:" "Cyan"
-    Write-Log ("  Prolog respondido pelo servidor : {0}" -f $(if($okProlog){'SIM'}else{'nao'})) "Gray"
-    Write-Log ("  Inventario gerado localmente     : {0}" -f $(if($okInvGen){'SIM'}else{'nao'})) "Gray"
-    Write-Log ("  Inventario aceito pelo servidor  : {0}" -f $(if($okInvSent){'SIM'}else{'nao'})) "Gray"
+    Write-Log ("  Inventario gerado/enviado        : {0}" -f $(if($okInvGen){'SIM'}else{'nao'})) "Gray"
+    Write-Log ("  Resposta HTTP 2xx do servidor    : {0}" -f $(if($okHttp2xx){'SIM'}else{'nao'})) "Gray"
+    Write-Log ("  Inventario confirmado (sent/resp): {0}" -f $(if($okInvSent){'SIM'}else{'nao'})) "Gray"
+
+    # Aviso benigno conhecido (nao derruba o sucesso)
+    if ($text -match 'Failed to write new inventory state') {
+        Write-Log "  (aviso benigno: falha ao gravar last_state - nao afeta o envio)" "DarkYellow"
+    }
 
     if ($failHits.Count -gt 0) {
         Write-Log "  Erros detectados no log:" "Red"
@@ -723,10 +733,9 @@ if ($NoInventory) {
 } else {
     Write-Log "--- Etapa 5: Forcando inventario e validando comunicacao ---" "Cyan"
 
-    # Pre-flight de TLS: diagnostica o certificado do servidor antes de tentar.
-    # Quando SSL=1, uma falha aqui aponta a causa raiz (cert publico x interno,
-    # HTTPS ausente, hostname/cadeia divergente) sem depender do log do agent.
-    if ($ocsUseSsl -eq 1) {
+    # Pre-flight de TLS: so faz sentido quando a comunicacao e HTTPS. Com Server
+    # http:// nao ha handshake TLS (mesmo com SSL=1), entao nao sondamos a 443.
+    if ($ocsProtocol -eq 'https') {
         $ocsHostName = ($ocsServerHost -split '/')[0]
         Test-OcsHttpsEndpoint -HostName $ocsHostName -CaBundlePath $cacertPath
     }
