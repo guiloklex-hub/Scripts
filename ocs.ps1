@@ -1,25 +1,34 @@
 <#
 .SYNOPSIS
-    Instalacao do OCS Inventory Agent com certificado SSL da CA interna.
+    Instalacao + hardening do OCS Inventory Agent com certificado SSL da CA interna.
 .DESCRIPTION
     Script auto-contido para deploy via ScreenConnect (ConnectWise).
     1. Deploya o cacert.pem (Root CA + Sub CA) no path do agent.
-    2. Verifica versao instalada vs versao GitHub.
-    3. Baixa e instala o OCS Agent se necessario.
+    2. Verifica versao instalada vs versao GitHub e instala/atualiza se necessario
+       (com SSL habilitado, apontando para o servidor HTTPS interno).
+    3. Valida a configuracao ATUAL do agent no registro (Server/SSL) contra o
+       alvo desejado e corrige divergencias (ex.: maquinas antigas em HTTP).
+    4. Forca a execucao imediata do inventario, obrigando a comunicacao com o
+       servidor, e valida o log (OCSInventory.log) para confirmar o envio.
 
     O certificado esta embutido no script para distribuicao simplificada.
 .PARAMETER ForceInstall
     Forca reinstalacao mesmo se a versao ja estiver atualizada.
 .PARAMETER CertOnly
-    Apenas deploya o certificado, sem instalar/atualizar o agent.
+    Apenas deploya o certificado, sem instalar/atualizar/validar/inventariar.
+.PARAMETER NoInventory
+    Executa deploy do cert, install e correcao de config, mas NAO forca o
+    inventario nem valida os logs de comunicacao.
 .NOTES
     Execute como Administrador.
     Distribuir via ScreenConnect backstage.
+    Exit code 0 = sucesso total; !=0 = houve falha (util para RMM).
 #>
 
 param(
     [switch]$ForceInstall,
-    [switch]$CertOnly
+    [switch]$CertOnly,
+    [switch]$NoInventory
 )
 
 $ErrorActionPreference = "Stop"
@@ -27,13 +36,29 @@ $ErrorActionPreference = "Stop"
 # ============================================================
 # CONFIGURACAO — altere aqui se necessario
 # ============================================================
-$ocsServerUrl   = "http://assets.madeiramadeira.com.br/ocsinventory"
+# Servidor de comunicacao (HTTPS + validacao de certificado via CA interna)
+$ocsProtocol    = "https"
+$ocsServerHost  = "assets.madeiramadeira.com.br/ocsinventory"
+$ocsServerUrl   = "$ocsProtocol`://$ocsServerHost"
+$ocsUseSsl      = 1   # 1 = valida certificado do servidor (exige cacert.pem)
+
 $ocsExePath     = "$env:ProgramFiles\OCS Inventory Agent\OCSInventory.exe"
-$cacertDir      = "$env:ProgramData\OCS Inventory NG\Agent"
+$ocsDataDir     = "$env:ProgramData\OCS Inventory NG\Agent"
+$cacertDir      = $ocsDataDir
 $cacertPath     = "$cacertDir\cacert.pem"
+$ocsIniPath     = "$ocsDataDir\ocsinventory.ini"
+$ocsLogPath     = "$ocsDataDir\OCSInventory.log"
 $downloadDir    = "$env:TEMP\OCS_AutoInstall"
 $ocsExtractDir  = "$downloadDir\OCS_Extracted"
 $githubApi      = "https://api.github.com/repos/OCSInventory-NG/WindowsAgent/releases/latest"
+$ocsServiceName = "OCS Inventory Service"
+
+# Chaves de registro onde o agent Windows guarda a config de comunicacao
+# (64-bit usa WOW6432Node; 32-bit usa o caminho nativo)
+$ocsRegKeys = @(
+    "HKLM:\SOFTWARE\WOW6432Node\OCS Inventory Agent\Agent",
+    "HKLM:\SOFTWARE\OCS Inventory Agent\Agent"
+)
 
 # ============================================================
 # CERTIFICADO CA INTERNA (Root CA + Sub CA)
@@ -114,12 +139,210 @@ function Get-OnlineVersion {
     param([string]$Url)
     Write-Log "Consultando versao no GitHub..." "Yellow"
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    return Invoke-RestMethod -Uri $Url
+    return Invoke-RestMethod -Uri $Url -UseBasicParsing
+}
+
+function Get-OcsRegistryKey {
+    # Retorna a primeira chave de registro do agent que existir (ou $null)
+    foreach ($key in $ocsRegKeys) {
+        if (Test-Path $key) { return $key }
+    }
+    return $null
+}
+
+function Get-OcsCurrentConfig {
+    # Le a config atual do agent no registro. Retorna hashtable com Server/SSL
+    # (valores podem ser $null se ausentes) e a chave usada.
+    param([string]$RegKey)
+    $cfg = @{ RegKey = $RegKey; Server = $null; SSL = $null }
+    if (-not $RegKey) { return $cfg }
+    try {
+        $props = Get-ItemProperty -Path $RegKey -ErrorAction SilentlyContinue
+        if ($null -ne $props) {
+            if ($props.PSObject.Properties.Name -contains 'Server') { $cfg.Server = $props.Server }
+            if ($props.PSObject.Properties.Name -contains 'SSL')    { $cfg.SSL    = [int]$props.SSL }
+        }
+    } catch {
+        Write-Log "Aviso: falha ao ler config do registro ($RegKey): $_" "Yellow"
+    }
+    return $cfg
+}
+
+function Set-OcsConfig {
+    # Aplica os valores desejados (Server/SSL) na chave de registro do agent.
+    param([string]$RegKey)
+    New-ItemProperty -Path $RegKey -Name "Server" -Value $ocsServerUrl -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $RegKey -Name "SSL"    -Value $ocsUseSsl   -PropertyType DWord  -Force | Out-Null
+}
+
+function Get-OcsIniConfig {
+    # Le Server/SSL/CA do ocsinventory.ini (config primaria dos agents 2.x).
+    # Retorna hashtable; valores $null se ausentes.
+    param([string]$IniPath)
+    $cfg = @{ Server = $null; SSL = $null; CA = $null; Exists = $false }
+    if (-not (Test-Path $IniPath)) { return $cfg }
+    $cfg.Exists = $true
+    try {
+        foreach ($line in (Get-Content -Path $IniPath -ErrorAction SilentlyContinue)) {
+            if ($line -match '^\s*Server\s*=\s*(.*?)\s*$') { $cfg.Server = $matches[1] }
+            elseif ($line -match '^\s*SSL\s*=\s*(.*?)\s*$') {
+                $v = $matches[1].Trim()
+                if ($v -match '^\d+$') { $cfg.SSL = [int]$v }
+            }
+            elseif ($line -match '^\s*CA\s*=\s*(.*?)\s*$') { $cfg.CA = $matches[1] }
+        }
+    } catch {
+        Write-Log "Aviso: falha ao ler ${IniPath}: $_" "Yellow"
+    }
+    return $cfg
+}
+
+function Set-OcsIniConfig {
+    # Atualiza Server/SSL/CA no ocsinventory.ini preservando o restante do
+    # arquivo. Edita as chaves dentro da secao [HTTP]; se ausentes, adiciona-as.
+    param([string]$IniPath)
+
+    # Se o arquivo nao existe, cria um minimo funcional
+    if (-not (Test-Path $IniPath)) {
+        $skeleton = @(
+            "[OCS Inventory Agent]",
+            "ComProvider=ComHTTP.dll",
+            "",
+            "[HTTP]",
+            "Server=$ocsServerUrl",
+            "SSL=$ocsUseSsl",
+            "CA=$cacertPath"
+        )
+        $skeleton | Set-Content -Path $IniPath -Encoding ASCII -Force
+        return
+    }
+
+    $lines = @(Get-Content -Path $IniPath -ErrorAction SilentlyContinue)
+    $out = New-Object System.Collections.Generic.List[string]
+    $section = ""
+    $inHttp = $false
+    $setServer = $false; $setSsl = $false; $setCa = $false
+
+    foreach ($line in $lines) {
+        if ($line -match '^\s*\[(.+?)\]\s*$') {
+            # Ao sair da secao [HTTP], garante que as chaves ausentes foram inseridas
+            if ($inHttp) {
+                if (-not $setServer) { $out.Add("Server=$ocsServerUrl"); $setServer = $true }
+                if (-not $setSsl)    { $out.Add("SSL=$ocsUseSsl");       $setSsl = $true }
+                if (-not $setCa)     { $out.Add("CA=$cacertPath");       $setCa = $true }
+            }
+            $section = $matches[1]
+            $inHttp = ($section -ieq 'HTTP')
+            $out.Add($line)
+            continue
+        }
+
+        if ($inHttp -and $line -match '^\s*Server\s*=') { $out.Add("Server=$ocsServerUrl"); $setServer = $true; continue }
+        if ($inHttp -and $line -match '^\s*SSL\s*=')    { $out.Add("SSL=$ocsUseSsl");       $setSsl = $true;    continue }
+        if ($inHttp -and $line -match '^\s*CA\s*=')     { $out.Add("CA=$cacertPath");       $setCa = $true;     continue }
+        $out.Add($line)
+    }
+
+    # Caso [HTTP] seja a ultima secao, fecha as chaves pendentes
+    if ($inHttp) {
+        if (-not $setServer) { $out.Add("Server=$ocsServerUrl"); $setServer = $true }
+        if (-not $setSsl)    { $out.Add("SSL=$ocsUseSsl");       $setSsl = $true }
+        if (-not $setCa)     { $out.Add("CA=$cacertPath");       $setCa = $true }
+    }
+
+    # Se nao havia secao [HTTP] em lugar nenhum, cria uma ao final
+    if (-not $setServer -and -not $setSsl) {
+        $out.Add("")
+        $out.Add("[HTTP]")
+        $out.Add("Server=$ocsServerUrl")
+        $out.Add("SSL=$ocsUseSsl")
+        $out.Add("CA=$cacertPath")
+    }
+
+    $out | Set-Content -Path $IniPath -Encoding ASCII -Force
+}
+
+function Restart-OcsService {
+    # Reinicia o servico do agent (best-effort) para carregar a nova config.
+    $svc = Get-Service | Where-Object { $_.Name -like "*OCS Inventory*" -or $_.DisplayName -like "*OCS Inventory*" } | Select-Object -First 1
+    if ($svc) {
+        try {
+            Restart-Service -Name $svc.Name -Force -ErrorAction Stop
+            Write-Log "Servico '$($svc.Name)' reiniciado." "Gray"
+        } catch {
+            Write-Log "Aviso: nao foi possivel reiniciar o servico '$($svc.Name)': $_" "Yellow"
+        }
+    } else {
+        Write-Log "Aviso: servico do OCS nao encontrado (inventario sera forcado via executavel)." "Yellow"
+    }
+}
+
+function Test-OcsInventoryLog {
+    # Analisa as linhas novas do OCSInventory.log procurando marcadores de
+    # sucesso/erro de comunicacao. Retorna $true se o envio foi confirmado.
+    param([string[]]$NewLines)
+
+    if (-not $NewLines -or $NewLines.Count -eq 0) {
+        Write-Log "[FALHA] Nenhuma linha nova gerada em OCSInventory.log — inventario nao rodou." "Red"
+        return $false
+    }
+
+    $text = ($NewLines -join "`n")
+
+    # Marcadores de sucesso do agent Windows do OCS
+    $okProlog    = $text -match 'Send Prolog Response'
+    $okInvSent   = $text -match 'Send Inventory Response'
+    $okInvGen    = $text -match 'Inventory successfully generated'
+
+    # Marcadores de falha
+    $failPatterns = @(
+        'Cannot establish communication',
+        'Failed to send',
+        'Communication failed',
+        '<ERROR>',
+        'ERROR:',
+        'SSL.*(fail|error|cannot)',
+        'certificate.*(fail|cannot|verify)',
+        'HTTP.*(4\d\d|5\d\d)',
+        'timed out'
+    )
+    $failHits = @()
+    foreach ($p in $failPatterns) {
+        foreach ($line in $NewLines) {
+            if ($line -match $p) { $failHits += $line.Trim() }
+        }
+    }
+    $failHits = $failHits | Select-Object -Unique
+
+    # Sucesso = inventario enviado e aceito pelo servidor, sem erro critico
+    $success = ($okInvSent -or ($okInvGen -and $okProlog)) -and ($failHits.Count -eq 0)
+
+    Write-Log "Analise do log de comunicacao:" "Cyan"
+    Write-Log ("  Prolog respondido pelo servidor : {0}" -f $(if($okProlog){'SIM'}else{'nao'})) "Gray"
+    Write-Log ("  Inventario gerado localmente     : {0}" -f $(if($okInvGen){'SIM'}else{'nao'})) "Gray"
+    Write-Log ("  Inventario aceito pelo servidor  : {0}" -f $(if($okInvSent){'SIM'}else{'nao'})) "Gray"
+
+    if ($failHits.Count -gt 0) {
+        Write-Log "  Erros detectados no log:" "Red"
+        foreach ($h in $failHits) { Write-Log "    > $h" "Red" }
+    }
+
+    if ($success) {
+        Write-Log "[OK] Comunicacao com o servidor confirmada pelo log." "Green"
+    } else {
+        Write-Log "[FALHA] Nao foi possivel confirmar o envio do inventario. Ultimas linhas do log:" "Red"
+        $tail = $NewLines | Select-Object -Last 15
+        foreach ($l in $tail) { Write-Log "    | $l" "DarkGray" }
+    }
+    return $success
 }
 
 # ============================================================
 # INICIO
 # ============================================================
+
+# Rastreio de resultado geral (vira exit code)
+$overallOk = $true
 
 # Verifica se esta rodando como Administrador
 if (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
@@ -128,7 +351,8 @@ if (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]:
     exit 1
 }
 
-Write-Log "=== OCS Inventory Agent - Install + Certificado ===" "Cyan"
+Write-Log "=== OCS Inventory Agent - Install + Certificado + Config + Inventario ===" "Cyan"
+Write-Log "Servidor alvo: $ocsServerUrl (SSL=$ocsUseSsl)" "Cyan"
 
 # ------------------------------------------------------------
 # ETAPA 1: Deploy do certificado cacert.pem
@@ -255,9 +479,9 @@ try {
 
         if (-not $ocsInstaller) { throw "Instalador nao encontrado apos download." }
 
-        Write-Log "Instalando OCS Agent..." "Yellow"
-        # /UPGRADE garante atualizacao suave se ja existir
-        $ocsArgs = "/S /NOSPLASH /NO_START_MENU /NOW /SERVER=$ocsServerUrl /UPGRADE"
+        Write-Log "Instalando OCS Agent (SSL habilitado, servidor HTTPS)..." "Yellow"
+        # /UPGRADE atualizacao suave; /SSL=1 valida cert; /CA aponta o bundle; /NOW roda inventario ao final
+        $ocsArgs = "/S /NOSPLASH /NO_START_MENU /SERVER=$ocsServerUrl /SSL=$ocsUseSsl /CA=`"$cacertPath`" /NOW /UPGRADE"
 
         $process = Start-Process -FilePath $ocsInstaller -ArgumentList $ocsArgs -Wait -PassThru
 
@@ -265,6 +489,7 @@ try {
             Write-Log "Instalacao concluida com sucesso!" "Green"
         } else {
             Write-Log "Instalacao terminou com codigo: $($process.ExitCode)" "Red"
+            $overallOk = $false
         }
 
         # Limpeza dos arquivos temporarios
@@ -282,11 +507,141 @@ try {
 }
 
 # ------------------------------------------------------------
-# ETAPA 4: Validacao final
+# ETAPA 4: Validacao e correcao da configuracao atual (registro)
 # ------------------------------------------------------------
-Write-Log "--- Etapa 4: Validacao ---" "Cyan"
+Write-Log "--- Etapa 4: Validacao da configuracao atual ---" "Cyan"
 
-$allOk = $true
+$configChanged = $false
+$configValidated = $false
+
+# --- 4a) Fonte primaria: ocsinventory.ini (agents 2.x) ---
+$ini = Get-OcsIniConfig -IniPath $ocsIniPath
+if ($ini.Exists) {
+    $configValidated = $true
+    Write-Log "Config primaria: $ocsIniPath" "Gray"
+    Write-Log ("Config atual   -> Server='{0}' SSL='{1}' CA='{2}'" -f $ini.Server, $ini.SSL, $ini.CA) "Gray"
+    Write-Log ("Config desejada -> Server='{0}' SSL='{1}' CA='{2}'" -f $ocsServerUrl, $ocsUseSsl, $cacertPath) "Gray"
+
+    $serverOk = ($ini.Server -and ($ini.Server.Trim() -ieq $ocsServerUrl))
+    $sslOk    = ($null -ne $ini.SSL -and [int]$ini.SSL -eq $ocsUseSsl)
+    $caOk     = ($ini.CA -and ($ini.CA.Trim() -ieq $cacertPath))
+
+    if ($serverOk -and $sslOk -and $caOk) {
+        Write-Log "[OK] ocsinventory.ini ja bate com o alvo." "Green"
+    } else {
+        if (-not $serverOk) { Write-Log "Divergencia no Server. Corrigindo..." "Magenta" }
+        if (-not $sslOk)    { Write-Log "Divergencia no SSL. Corrigindo..." "Magenta" }
+        if (-not $caOk)     { Write-Log "Divergencia no CA. Corrigindo..." "Magenta" }
+        try {
+            # Backup antes de alterar
+            $iniBackup = "$ocsIniPath.bak_$((Get-Date).ToString('yyyyMMdd_HHmmss'))"
+            Copy-Item -Path $ocsIniPath -Destination $iniBackup -Force
+            Set-OcsIniConfig -IniPath $ocsIniPath
+            $configChanged = $true
+            Write-Log "[OK] ocsinventory.ini corrigido (backup: $iniBackup)." "Green"
+        } catch {
+            Write-Log "[FALHA] Nao foi possivel corrigir o ocsinventory.ini: $_" "Red"
+            $overallOk = $false
+        }
+    }
+} elseif (Test-Path $ocsExePath) {
+    # Agent instalado mas sem .ini: cria um coerente com o alvo
+    Write-Log "ocsinventory.ini ausente — criando com a config desejada." "Magenta"
+    try {
+        Set-OcsIniConfig -IniPath $ocsIniPath
+        $configChanged = $true
+        $configValidated = $true
+        Write-Log "[OK] ocsinventory.ini criado." "Green"
+    } catch {
+        Write-Log "[FALHA] Nao foi possivel criar o ocsinventory.ini: $_" "Red"
+        $overallOk = $false
+    }
+}
+
+# --- 4b) Fallback legado: registro (agents 1.x) ---
+$regKey = Get-OcsRegistryKey
+if ($regKey) {
+    $current = Get-OcsCurrentConfig -RegKey $regKey
+    $rServerOk = ($current.Server -and ($current.Server.Trim() -ieq $ocsServerUrl))
+    $rSslOk    = ($null -ne $current.SSL -and [int]$current.SSL -eq $ocsUseSsl)
+    if (-not ($rServerOk -and $rSslOk)) {
+        Write-Log "Config legada no registro divergente ($regKey). Corrigindo..." "Magenta"
+        try {
+            Set-OcsConfig -RegKey $regKey
+            $configChanged = $true
+            $configValidated = $true
+            Write-Log "[OK] Registro legado corrigido." "Green"
+        } catch {
+            Write-Log "[AVISO] Falha ao corrigir registro legado: $_" "Yellow"
+        }
+    } else {
+        $configValidated = $true
+        Write-Log "[OK] Registro legado ja bate com o alvo." "Gray"
+    }
+}
+
+if (-not $configValidated -and (Test-Path $ocsExePath)) {
+    Write-Log "[AVISO] Nao foi possivel localizar nenhuma config (.ini/registro) do agent." "Yellow"
+    $overallOk = $false
+}
+
+# ------------------------------------------------------------
+# ETAPA 5: Forcar inventario e validar comunicacao pelos logs
+# ------------------------------------------------------------
+$inventoryOk = $null
+if ($NoInventory) {
+    Write-Log "--- Etapa 5: pulada (-NoInventory) ---" "Yellow"
+} elseif (-not (Test-Path $ocsExePath)) {
+    Write-Log "--- Etapa 5: agent nao instalado, inventario nao pode ser forcado ---" "Yellow"
+    $overallOk = $false
+} else {
+    Write-Log "--- Etapa 5: Forcando inventario e validando comunicacao ---" "Cyan"
+
+    # Recarrega a config se ela foi alterada
+    if ($configChanged) { Restart-OcsService }
+
+    # Captura o estado do log antes da execucao para isolar as linhas novas
+    $preLines = 0
+    if (Test-Path $ocsLogPath) {
+        $preLines = @(Get-Content -Path $ocsLogPath -ErrorAction SilentlyContinue).Count
+    }
+
+    Write-Log "Executando OCSInventory.exe /NOW /DEBUG (forcando envio)..." "Yellow"
+    try {
+        # /NOW ignora frequencia; /DEBUG gera log detalhado; /SERVER garante o destino
+        $invArgs = "/NOW /DEBUG /SERVER=$ocsServerUrl /SSL=$ocsUseSsl"
+        $invProc = Start-Process -FilePath $ocsExePath -ArgumentList $invArgs -Wait -PassThru
+        Write-Log "OCSInventory.exe encerrou com codigo: $($invProc.ExitCode)" "Gray"
+    } catch {
+        Write-Log "[FALHA] Erro ao executar o inventario: $_" "Red"
+        $overallOk = $false
+    }
+
+    # Da um instante para o log ser flushado ao disco
+    Start-Sleep -Seconds 3
+
+    # Le apenas as linhas geradas por esta execucao
+    $newLines = @()
+    if (Test-Path $ocsLogPath) {
+        $allLines = @(Get-Content -Path $ocsLogPath -ErrorAction SilentlyContinue)
+        if ($allLines.Count -gt $preLines) {
+            $newLines = $allLines[$preLines..($allLines.Count - 1)]
+        } else {
+            # Log foi rotacionado/truncado — analisa o conteudo inteiro
+            $newLines = $allLines
+        }
+    } else {
+        Write-Log "[FALHA] Log de inventario nao encontrado em $ocsLogPath" "Red"
+    }
+
+    $inventoryOk = Test-OcsInventoryLog -NewLines $newLines
+    if (-not $inventoryOk) { $overallOk = $false }
+}
+
+# ------------------------------------------------------------
+# ETAPA 6: Validacao final
+# ------------------------------------------------------------
+Write-Log "--- Etapa 6: Resumo ---" "Cyan"
 
 # Verifica certificado
 if (Test-Path $cacertPath) {
@@ -294,7 +649,7 @@ if (Test-Path $cacertPath) {
     Write-Log "[OK] cacert.pem presente ($certSize bytes)" "Green"
 } else {
     Write-Log "[FALHA] cacert.pem NAO encontrado em $cacertPath" "Red"
-    $allOk = $false
+    $overallOk = $false
 }
 
 # Verifica agent instalado
@@ -303,12 +658,23 @@ if (Test-Path $ocsExePath) {
     Write-Log "[OK] OCS Agent instalado (versao: $ver)" "Green"
 } else {
     Write-Log "[AVISO] OCS Agent nao encontrado em $ocsExePath" "Yellow"
-    if (-not $CertOnly) { $allOk = $false }
+    $overallOk = $false
 }
 
-# Resultado final
-if ($allOk) {
-    Write-Log "=== Deploy concluido com sucesso! ===" "Green"
+# Status do inventario
+if ($null -ne $inventoryOk) {
+    if ($inventoryOk) {
+        Write-Log "[OK] Inventario enviado e confirmado pelo servidor." "Green"
+    } else {
+        Write-Log "[FALHA] Inventario nao confirmado — verifique conectividade/HTTPS/cert." "Red"
+    }
+}
+
+# Resultado final + exit code para RMM
+if ($overallOk) {
+    Write-Log "=== Deploy concluido com SUCESSO! ===" "Green"
+    exit 0
 } else {
-    Write-Log "=== Deploy concluido com avisos. Verifique os itens acima. ===" "Yellow"
+    Write-Log "=== Deploy concluido com FALHAS. Verifique os itens acima. ===" "Red"
+    exit 1
 }
