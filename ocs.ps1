@@ -262,9 +262,45 @@ function Set-OcsIniConfig {
     $out | Set-Content -Path $IniPath -Encoding ASCII -Force
 }
 
+function Get-OcsService {
+    # Retorna o objeto do servico do agent (ou $null).
+    return Get-Service -ErrorAction SilentlyContinue |
+           Where-Object { $_.Name -like "*OCS Inventory*" -or $_.DisplayName -like "*OCS Inventory*" } |
+           Select-Object -First 1
+}
+
+function Stop-OcsService {
+    # Para o servico (libera o lock do ocsinventory.ini). Retorna $true se
+    # estava rodando e foi parado.
+    $svc = Get-OcsService
+    if ($svc -and $svc.Status -ne 'Stopped') {
+        try {
+            Stop-Service -Name $svc.Name -Force -ErrorAction Stop
+            Write-Log "Servico '$($svc.Name)' parado (liberando ocsinventory.ini)." "Gray"
+            return $true
+        } catch {
+            Write-Log "Aviso: nao foi possivel parar o servico '$($svc.Name)': $_" "Yellow"
+        }
+    }
+    return $false
+}
+
+function Start-OcsService {
+    # Inicia o servico se nao estiver rodando (idempotente, best-effort).
+    $svc = Get-OcsService
+    if ($svc -and $svc.Status -ne 'Running') {
+        try {
+            Start-Service -Name $svc.Name -ErrorAction Stop
+            Write-Log "Servico '$($svc.Name)' iniciado." "Gray"
+        } catch {
+            Write-Log "Aviso: nao foi possivel iniciar o servico '$($svc.Name)': $_" "Yellow"
+        }
+    }
+}
+
 function Restart-OcsService {
     # Reinicia o servico do agent (best-effort) para carregar a nova config.
-    $svc = Get-Service | Where-Object { $_.Name -like "*OCS Inventory*" -or $_.DisplayName -like "*OCS Inventory*" } | Select-Object -First 1
+    $svc = Get-OcsService
     if ($svc) {
         try {
             Restart-Service -Name $svc.Name -Force -ErrorAction Stop
@@ -274,6 +310,90 @@ function Restart-OcsService {
         }
     } else {
         Write-Log "Aviso: servico do OCS nao encontrado (inventario sera forcado via executavel)." "Yellow"
+    }
+}
+
+function Get-ServerCertInfo {
+    # Conecta via TLS e retorna o X509Certificate2 apresentado pelo servidor
+    # (best-effort, callback permissivo so para inspecao). Retorna $null em erro.
+    param([string]$HostName, [int]$Port = 443)
+    $cert = $null
+    $tcp = $null
+    $ssl = $null
+    try {
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        $tcp.Connect($HostName, $Port)
+        $cb  = [System.Net.Security.RemoteCertificateValidationCallback]{ param($a, $b, $c, $d) $true }
+        $ssl = New-Object System.Net.Security.SslStream($tcp.GetStream(), $false, $cb)
+        $ssl.AuthenticateAsClient($HostName)
+        $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($ssl.RemoteCertificate)
+    } catch {
+        Write-Log "Nao foi possivel obter o certificado de ${HostName}:${Port} - $_" "Yellow"
+    } finally {
+        if ($ssl) { $ssl.Dispose() }
+        if ($tcp) { $tcp.Close() }
+    }
+    return $cert
+}
+
+function Test-OcsHttpsEndpoint {
+    # Pre-flight de TLS: mostra o certificado que o servidor apresenta e valida
+    # se ele encadeia na CA interna deployada (cacert.pem). Apenas informativo.
+    param([string]$HostName, [string]$CaBundlePath)
+
+    Write-Log "Diagnostico TLS de https://${HostName} ..." "Cyan"
+    $cert = Get-ServerCertInfo -HostName $HostName -Port 443
+    if (-not $cert) {
+        Write-Log "  [!] Servidor nao respondeu TLS na 443 (HTTPS pode nao estar habilitado)." "Red"
+        return
+    }
+
+    Write-Log "  Subject : $($cert.Subject)" "Gray"
+    Write-Log "  Issuer  : $($cert.Issuer)" "Gray"
+    Write-Log "  Validade: $($cert.NotBefore.ToString('yyyy-MM-dd')) ate $($cert.NotAfter.ToString('yyyy-MM-dd'))" "Gray"
+    try {
+        # OID 2.5.29.17 = Subject Alternative Name (evita FriendlyName localizado)
+        $san = ($cert.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.17' } | Select-Object -First 1)
+        if ($san) { Write-Log "  SAN     : $($san.Format($false))" "Gray" }
+    } catch {}
+
+    $isInternal = $cert.Issuer -match 'MadeiraMadeira'
+    if ($isInternal) {
+        Write-Log "  -> Emitido pela CA interna MadeiraMadeira (bundle interno e o correto)." "Gray"
+    } else {
+        Write-Log "  -> NAO emitido pela CA interna. O bundle interno (cacert.pem) vai REJEITAR este cert." "Yellow"
+        Write-Log "     Use um cert da CA interna no servidor OU aponte o CA para um bundle publico." "Yellow"
+    }
+
+    # Testa se o cert encadeia na CA do cacert.pem deployado
+    if (Test-Path $CaBundlePath) {
+        try {
+            $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+            $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+            $chain.ChainPolicy.VerificationFlags = [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::AllowUnknownCertificateAuthority
+            foreach ($line in (Get-Content $CaBundlePath -Raw) -split '(?=-----BEGIN CERTIFICATE-----)') {
+                $line = $line.Trim()
+                if ($line) {
+                    try {
+                        $bytes = [System.Text.Encoding]::ASCII.GetBytes($line)
+                        $caCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(,$bytes)
+                        [void]$chain.ChainPolicy.ExtraStore.Add($caCert)
+                    } catch {}
+                }
+            }
+            $built = $chain.Build($cert)
+            $chainToOurCa = $false
+            foreach ($el in $chain.ChainElements) {
+                if ($el.Certificate.Issuer -match 'MadeiraMadeira' -or $el.Certificate.Subject -match 'MadeiraMadeira') { $chainToOurCa = $true }
+            }
+            if ($chainToOurCa) {
+                Write-Log "  Cadeia contra cacert.pem: encadeia na CA MadeiraMadeira (build=$built)." "Gray"
+            } else {
+                Write-Log "  Cadeia contra cacert.pem: NAO encadeia na CA interna (build=$built)." "Yellow"
+            }
+        } catch {
+            Write-Log "  Aviso: falha ao testar cadeia contra o bundle: $_" "Yellow"
+        }
     }
 }
 
@@ -513,6 +633,7 @@ Write-Log "--- Etapa 4: Validacao da configuracao atual ---" "Cyan"
 
 $configChanged = $false
 $configValidated = $false
+$serviceStopped = $false
 
 # --- 4a) Fonte primaria: ocsinventory.ini (agents 2.x) ---
 $ini = Get-OcsIniConfig -IniPath $ocsIniPath
@@ -536,6 +657,8 @@ if ($ini.Exists) {
             # Backup antes de alterar
             $iniBackup = "$ocsIniPath.bak_$((Get-Date).ToString('yyyyMMdd_HHmmss'))"
             Copy-Item -Path $ocsIniPath -Destination $iniBackup -Force
+            # O servico mantem o .ini aberto - parar antes de escrever
+            if (-not $serviceStopped) { $serviceStopped = Stop-OcsService }
             Set-OcsIniConfig -IniPath $ocsIniPath
             $configChanged = $true
             Write-Log "[OK] ocsinventory.ini corrigido (backup: $iniBackup)." "Green"
@@ -548,6 +671,7 @@ if ($ini.Exists) {
     # Agent instalado mas sem .ini: cria um coerente com o alvo
     Write-Log "ocsinventory.ini ausente - criando com a config desejada." "Magenta"
     try {
+        if (-not $serviceStopped) { $serviceStopped = Stop-OcsService }
         Set-OcsIniConfig -IniPath $ocsIniPath
         $configChanged = $true
         $configValidated = $true
@@ -597,8 +721,16 @@ if ($NoInventory) {
 } else {
     Write-Log "--- Etapa 5: Forcando inventario e validando comunicacao ---" "Cyan"
 
-    # Recarrega a config se ela foi alterada
-    if ($configChanged) { Restart-OcsService }
+    # Pre-flight de TLS: diagnostica o certificado do servidor antes de tentar.
+    # Quando SSL=1, uma falha aqui aponta a causa raiz (cert publico x interno,
+    # HTTPS ausente, hostname/cadeia divergente) sem depender do log do agent.
+    if ($ocsUseSsl -eq 1) {
+        $ocsHostName = ($ocsServerHost -split '/')[0]
+        Test-OcsHttpsEndpoint -HostName $ocsHostName -CaBundlePath $cacertPath
+    }
+
+    # Recarrega a config se ela foi alterada (e reinicia o servico que paramos)
+    if ($configChanged) { Restart-OcsService } else { Start-OcsService }
 
     # Captura o estado do log antes da execucao para isolar as linhas novas
     $preLines = 0
@@ -642,6 +774,9 @@ if ($NoInventory) {
 # ETAPA 6: Validacao final
 # ------------------------------------------------------------
 Write-Log "--- Etapa 6: Resumo ---" "Cyan"
+
+# Garante que o servico nao ficou parado (ex.: -NoInventory apos alterar config)
+if ($serviceStopped) { Start-OcsService }
 
 # Verifica certificado
 if (Test-Path $cacertPath) {
