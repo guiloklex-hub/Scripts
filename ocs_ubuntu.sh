@@ -225,14 +225,26 @@ else
     INV_RC=$?
     log "ocsinventory-agent encerrou com codigo: $INV_RC" "$GRAY"
 
-    # Marcadores de erro criticos do agent Perl (loga com prefixo [error]) e da
-    # camada de rede/TLS. "failed to write ... state" e aviso benigno e e excluido.
+    # Marcadores de erro criticos: o agent Perl loga falhas com prefixo [error];
+    # tambem cobrimos rede/TLS. O status HTTP e ancorado na sintaxe real
+    # (HTTP/1.1 500) para nao casar com numeros dentro de URLs (ex.: xxHash em
+    # cyan4973.github.io). "failed to write ... state" e aviso benigno (excluido).
     ERR_LINES=$(printf '%s\n' "$INV_OUT" \
-        | grep -iE '\[error\]|connection refused|cannot connect|unable to connect|network is unreachable|no route to host|could not connect|timed out|timeout|ssl.*(error|fail)|handshake|http.*(4[0-9][0-9]|5[0-9][0-9])' \
+        | grep -iE '\[error\]|connection refused|cannot connect|unable to connect|network is unreachable|no route to host|could not connect|connection timed out|timed out|SSL connect error|ssl.*(error|fail)|handshake (failed|failure)|HTTP/[0-9.]+[[:space:]]+(4[0-9][0-9]|5[0-9][0-9])' \
         | grep -viE 'failed to (write|save).*(state|last_state)')
 
-    if [ "$INV_RC" -eq 0 ] && [ -z "$ERR_LINES" ]; then
-        log "[OK] Inventario enviado com sucesso (rc=0, sem erros no log)." "$GREEN"
+    # Sinais de que o servidor respondeu (protocolo PROLOG do agent Perl):
+    # <RESPONSE>...</RESPONSE>, marcador =END=SERVER RET ou "End of work".
+    SERVER_REPLIED=$(printf '%s\n' "$INV_OUT" | grep -iE '<RESPONSE>|=END=SERVER RET|End of work')
+
+    # Sucesso = sem erro critico E (rc 0 OU o servidor respondeu). O "OU servidor
+    # respondeu" evita falso negativo quando o rc vem !=0 por motivo secundario.
+    if [ -z "$ERR_LINES" ] && { [ "$INV_RC" -eq 0 ] || [ -n "$SERVER_REPLIED" ]; }; then
+        if [ -n "$SERVER_REPLIED" ]; then
+            log "[OK] Inventario enviado - servidor respondeu ao agent (rc=$INV_RC)." "$GREEN"
+        else
+            log "[OK] Inventario enviado (rc=0, sem erros no log)." "$GREEN"
+        fi
         INV_OK=1
     else
         log "[FALHA] Nao foi possivel confirmar o envio do inventario (rc=$INV_RC)." "$RED"
